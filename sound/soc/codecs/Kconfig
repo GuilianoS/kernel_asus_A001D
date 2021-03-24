@@ -879,4 +879,10 @@ config SND_SOC_MSM_HDMI_CODEC_RX
 config SND_SOC_MSM_HDMI_DBA_CODEC_RX
 	bool "HDMI DBA Audio Playback"
 	depends on MSM_DBA
+
+config SND_SOC_TFA98XX
+	tristate	
+	default y
+	
+	
 endmenu
