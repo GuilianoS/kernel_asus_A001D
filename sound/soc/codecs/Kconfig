@@ -880,9 +880,8 @@ config SND_SOC_MSM_HDMI_DBA_CODEC_RX
 	bool "HDMI DBA Audio Playback"
 	depends on MSM_DBA
 
-config SND_SOC_TFA98XX
-	tristate	
-	default y
-	
+config SND_SOC_TFA9874
+	tristate "NXP Semiconductors TFA9874 audio amplifier"
+	depends on I2C
 	
 endmenu
