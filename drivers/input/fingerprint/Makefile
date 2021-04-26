@@ -1,2 +1,2 @@
-obj-$(CONFIG_FINGERPRINT_GOODIX_GF3208) += goodix/
-obj-$(CONFIG_FINGERPRINT_FPC1020) += fpc/
+obj-$(CONFIG_GOODIX_FINGERPRINT)	+= goodix_fp/
+obj-$(CONFIG_BETTERLIFE_FINGERPRINT)	+= betterlife_fp/
