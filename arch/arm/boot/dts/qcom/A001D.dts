@@ -6348,9 +6348,11 @@
 			qcom,use-bam;
 			qcom,use-pinctrl;
 			qcom,ver-reg-exists;
+			qcom,shared;
 			qcom,bam-consumer-pipe-index = <0x08>;
 			qcom,bam-producer-pipe-index = <0x09>;
 			qcom,master-id = <0x56>;
+			status = "ok";
 		};
 
 		i2c@78b6000 {
@@ -11902,9 +11904,9 @@
 			spi-max-frequency = <0x493e00>;
 			interrupt-parent = <0xbe>;
 			interrupts = <0x30 0x00>;
-			betterlife,gpio_reset = <0xbe 0x8c 0x00>;
-			betterlife,gpio_irq = <0xbe 0x30 0x00>;
-			betterlife,gpio_pwr = <0xbe 0x09 0x00>;
+			fpreset-gpio = <0xbe 0x8c 0x00>;
+			fpint-gpio = <0xbe 0x30 0x00>;
+			fppower-gpio = <0xbe 0x09 0x00>;
 			status = "ok";
 		};
 

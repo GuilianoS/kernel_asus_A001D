@@ -21,6 +21,7 @@
 #include <linux/miscdevice.h>
 #include <linux/signal.h>
 #include <linux/ctype.h>
+#include <linux/wakelock.h>
 #include <linux/kobject.h>
 #include <linux/poll.h>
 #include <net/sock.h>
@@ -49,7 +50,6 @@
 #endif
 
 #include "bf_fp_platform.h"
-static int bf_create_inputdev(void);
 
 #define BF_IOCTL_MAGIC_NO                   0xFC
 #define BF_IOCTL_INIT_ARGS                  _IOWR(BF_IOCTL_MAGIC_NO, 0,uint32_t)
@@ -74,13 +74,10 @@ static int bf_create_inputdev(void);
 #define BF_IOCTL_LOW_RESET                  _IO(BF_IOCTL_MAGIC_NO,  19)
 #define BF_IOCTL_HIGH_RESET                 _IO(BF_IOCTL_MAGIC_NO,  20)
 #define BF_IOCTL_NETLINK_INIT               _IOW(BF_IOCTL_MAGIC_NO,  21,uint32_t)
-#define BF_IOCTL_TRANS_IC_INFO              _IOW(BF_IOCTL_MAGIC_NO,  22,uint32_t)
+#define BF_IOCTL_NETLINK_PORT               _IOWR(BF_IOCTL_MAGIC_NO, 22,uint32_t)
 #define BF_IOCTL_ENABLE_INTERRUPT           _IO(BF_IOCTL_MAGIC_NO,  23)
 #define BF_IOCTL_RESET_FLAG                 _IOW(BF_IOCTL_MAGIC_NO,  24,uint32_t)
 #define BF_IOCTL_IS_OPT_POWER_ON2V8       	_IOWR(BF_IOCTL_MAGIC_NO,  25, uint32_t)
-#define BF_IOCTL_CREATE_INPUT               _IO(BF_IOCTL_MAGIC_NO,  26)
-#define BF_IOCTL_COMPATIBLE_IN_HAL          _IOWR(BF_IOCTL_MAGIC_NO,  27, uint32_t)
-
 typedef enum bf_key {
     BF_KEY_NONE = 0,
     BF_KEY_POWER,
@@ -99,24 +96,13 @@ static int g_pid;
 static int g_netlink_port = NETLINK_BF;
 struct bf_device *g_bf_dev = NULL;
 static struct input_dev *bf_inputdev = NULL;
-bl_ic_info_t ic_info;
 static uint32_t bf_key_need_report = 0;
-static void bf_unregister(void);
-
-#ifdef KERNEL_4_9
-static struct wakeup_source fp_suspend_lock;
-static struct wakeup_source hw_reset_lock;
-#else
 static struct wake_lock fp_suspend_lock;
 static struct wake_lock hw_reset_lock;
-#endif
 static struct kobject *bf_kobj = NULL;
 static DEFINE_MUTEX(irq_count_lock);
-static DEFINE_MUTEX(g_dev_lock);
 static irqreturn_t bf_eint_handler (int irq, void *data);
-int g_bl229x_enbacklight = 1;
-
-extern u32 g_chip_type;
+static int bf_init_dts_and_irq(struct bf_device *bf_dev);
 
 #ifdef MTK_ANDROID_L
 #include <cust_eint.h>
@@ -176,10 +162,7 @@ static inline int gpio_direction_output(unsigned gpio, int value)
 
 static inline int gpio_request(unsigned gpio, const char *label)
 {
-    if (gpio == bf_dev->irq_gpio) //(strcmp(label, "bf irq_gpio")==0)
-        return mt_set_gpio_mode((gpio | 0x80000000), GPIO_FP_INT_PIN_M_EINT);
-    else
-        return mt_set_gpio_mode((gpio | 0x80000000), GPIO_MODE_00);
+    return mt_set_gpio_mode((gpio | 0x80000000), GPIO_MODE_00);
 }
 
 static inline int gpio_to_irq(unsigned int gpio)
@@ -215,8 +198,7 @@ static int fb_notifier_callback(struct notifier_block *self,
 {
     struct fb_event *evdata = data;
     int *blank =  evdata->data;
-    mutex_lock(&g_dev_lock);
-    if (g_bf_dev && evdata && evdata->data) {
+    if (evdata && evdata->data) {
         if (event == FB_EVENT_BLANK ) {
             if (*blank == FB_BLANK_UNBLANK) {
                 BF_LOG("fb_notifier_callback FB_BLANK_UNBLANK:%d", g_bf_dev->need_report);
@@ -229,30 +211,21 @@ static int fb_notifier_callback(struct notifier_block *self,
             }
         }
     }
-    mutex_unlock(&g_dev_lock);
     return 0;
 }
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
 static void early_suspend(struct bf_device *bf_dev)
 {
     BF_LOG("++++++++++\n");
-    mutex_lock(&g_dev_lock);
-    if (g_bf_dev) {
-        g_bf_dev->need_report = 1;
-        bf_send_netlink_msg(g_bf_dev, BF_NETLINK_CMD_SCREEN_OFF);
-    }
-    mutex_unlock(&g_dev_lock);
+    g_bf_dev->need_report = 1;
+    bf_send_netlink_msg(g_bf_dev, BF_NETLINK_CMD_SCREEN_OFF);
     BF_LOG("----------\n");
 }
 static void early_resume(struct bf_device *bf_dev)
 {
     BF_LOG("+++++++++++\n");
-    mutex_lock(&g_dev_lock);
-    if (g_bf_dev) {
-        g_bf_dev->need_report = 0;
-        bf_send_netlink_msg(g_bf_dev, BF_NETLINK_CMD_SCREEN_ON);
-    }
-    mutex_unlock(&g_dev_lock);
+    g_bf_dev->need_report = 0;
+    bf_send_netlink_msg(g_bf_dev, BF_NETLINK_CMD_SCREEN_ON);
     BF_LOG("----------\n");
 }
 #endif
@@ -351,29 +324,13 @@ static ssize_t bf_store_hwreset(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR(reset, 0664, bf_show_hwreset, bf_store_hwreset);
 
-
-#if defined(NEED_OPT_POWER_ON2V8) || defined(NEED_OPT_POWER_ON1V8)
-
 static ssize_t bf_show_powermode(struct device *ddri, struct device_attribute *attr, char *buf)
 {
-	ssize_t length = 0;
+    u32 pin_val = -1;
+    pin_val = gpio_get_value(g_bf_dev->power_gpio);
+    BF_LOG("power pin_val=%d\n", pin_val);
 
-#ifdef NEED_OPT_POWER_ON2V8
-    u32 pin_val_2v8 = -1;
-
-    pin_val_2v8 = gpio_get_value(g_bf_dev->power_2v8_gpio);
-	BF_LOG("power pin_val_2v8=%d\n", pin_val_2v8);
-	length = sprintf(buf, "power pin_val_2v8=%d\n", pin_val_2v8);
-#endif
-#ifdef NEED_OPT_POWER_ON1V8
-    u32 pin_val_1v8 = -1;
-
-    pin_val_1v8 = gpio_get_value(g_bf_dev->power_1v8_gpio);
-    BF_LOG("power pin_val_1v8=%d\n", pin_val_1v8);
-	length = length + sprintf(buf + length, "power pin_val_1v8=%d\n", pin_val_1v8);
-#endif
-	
-    return length;
+    return sprintf(buf, "power pin_val=%d\n", pin_val);
 }
 static ssize_t bf_store_powermode(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
 {
@@ -389,25 +346,20 @@ static ssize_t bf_store_powermode(struct device *dev, struct device_attribute *a
     return size;
 }
 static DEVICE_ATTR(power, 0664, bf_show_powermode, bf_store_powermode);
-#endif
-#if 0
+
 /*----------------------------------------------------------------------------*/
 static struct device_attribute *bf_attr_list[] = {
     &dev_attr_reset,
-#if defined(NEED_OPT_POWER_ON2V8) || defined(NEED_OPT_POWER_ON1V8)		
-    &dev_attr_power
-#endif
+    &dev_attr_power,
 };
-#endif
 /*----------------------------------------------------------------------------*/
-/*
 static void bf_create_attributes(struct device *dev)
 {
     int num = (int)(sizeof(bf_attr_list) / sizeof(bf_attr_list[0]));
     for (; num > 0;)
         device_create_file(dev, bf_attr_list[--num]);
 }
-*/
+
 static int bf_sysfs_init(void)
 {
     int ret = 0;
@@ -419,9 +371,8 @@ static int bf_sysfs_init(void)
     }
 
     ret = sysfs_create_file(bf_kobj, &dev_attr_reset.attr);
-#if defined(NEED_OPT_POWER_ON2V8) || defined(NEED_OPT_POWER_ON1V8)	
     ret = sysfs_create_file(bf_kobj, &dev_attr_power.attr);
-#endif
+
     if(ret) {
         BF_LOG("sysfs_create_file failed\n");
     }
@@ -441,20 +392,18 @@ static int bf_sysfs_uninit(void)
     }
 
     sysfs_remove_file(bf_kobj, &dev_attr_reset.attr);
-#if defined(NEED_OPT_POWER_ON2V8) || defined(NEED_OPT_POWER_ON1V8)	
     sysfs_remove_file(bf_kobj, &dev_attr_power.attr);
-#endif
     kobject_del(bf_kobj);
     return ret;
 }
-/*
+
 static void bf_remove_attributes(struct device *dev)
 {
     int num = (int)(sizeof(bf_attr_list) / sizeof(bf_attr_list[0]));
     for (; num > 0;)
         device_remove_file(dev, bf_attr_list[--num]);
 }
-*/
+
 /**
  * get gpio information from device tree
  */
@@ -482,8 +431,8 @@ static int bf_main_get_gpio_info (struct bf_device *bf_dev)
         }
 
         //if gpio_to_irq cause irq has problem then chang to use irq_of_parse_and_map func and dts needto modify
-        //bf_dev->irq_num = irq_of_parse_and_map(bf_dev->pdev->dev.of_node, 0);
-        bf_dev->irq_num = gpio_to_irq(bf_dev->irq_gpio);
+        bf_dev->irq_num = irq_of_parse_and_map(bf_dev->pdev->dev.of_node, 0);
+        //bf_dev->irq_num = gpio_to_irq(bf_dev->irq_gpio);
         if(!bf_dev->irq_num) {
             BF_LOG("get irq number fail:%d", bf_dev->irq_num);
             return -ENXIO;
@@ -491,14 +440,17 @@ static int bf_main_get_gpio_info (struct bf_device *bf_dev)
         BF_LOG("fpreset-gpio:%d, fpint-gpio:%d, irq_num:%d", bf_dev->reset_gpio, bf_dev->irq_gpio, bf_dev->irq_num);
 #ifdef NEED_OPT_POWER_ON2V8
         bf_dev->power_2v8_gpio =  of_get_named_gpio(node, "fppower-gpio", 0);
+        BF_LOG("power_2v8_gpio:%d", bf_dev->power_2v8_gpio);
         if(bf_dev->power_2v8_gpio < 0) {
             BF_LOG("get fppower-gpio fail:%d", bf_dev->power_2v8_gpio);
             return bf_dev->power_2v8_gpio;
         }
+
 #endif    //NEED_OPT_POWER_ON2V8
 
 #ifdef NEED_OPT_POWER_ON1V8
         bf_dev->power_1v8_gpio =  of_get_named_gpio(node, "fppower-gpio1v8", 0);
+        BF_LOG("power_1v8_gpio:%d", bf_dev->power_1v8_gpio);
         if(bf_dev->power_1v8_gpio < 0) {
             BF_LOG("get fppower-gpio fail:%d", bf_dev->power_1v8_gpio);
             return bf_dev->power_1v8_gpio;
@@ -740,8 +692,7 @@ static void bf_main_gpio_uninit(struct bf_device *bf_dev)
 static void bf_main_pin_uninit(struct bf_device *bf_dev)
 {
 #ifdef BF_PINCTL
-    if(!IS_ERR (bf_dev->pinctrl_gpios))
-        devm_pinctrl_put(bf_dev->pinctrl_gpios);
+    devm_pinctrl_put(bf_dev->pinctrl_gpios);
 #endif
 }
 
@@ -755,7 +706,7 @@ static int32_t bf_main_pin_init(struct bf_device *bf_dev)
         BF_LOG("bf_main_pinctrl_init fail!");
     }
 
-#else /*else BF_GPIOCTRL*/
+#else /*else BF_PINCTRL*/
     error = bf_main_gpio_init(bf_dev);
     if(error) {
         BF_LOG("bf_main_gpio_init fail!");
@@ -820,7 +771,7 @@ static void bf_recv_netlink_msg(struct sk_buff *__skb)
 {
     struct sk_buff *skb = NULL;
     struct nlmsghdr *nlh = NULL;
-    char str[128];
+
 
     skb = skb_get(__skb);
     if (skb == NULL) {
@@ -831,9 +782,11 @@ static void bf_recv_netlink_msg(struct sk_buff *__skb)
     if (skb->len >= NLMSG_SPACE(0)) {
         nlh = nlmsg_hdr(skb);
         //add by wangdongbo
-        //memcpy(str, NLMSG_DATA(nlh), sizeof(str));
+
         g_pid = nlh->nlmsg_pid;
-        BF_LOG("pid: %d, msg: %s", g_pid, str);
+        //char str[128];
+        //memcpy(str, NLMSG_DATA(nlh), sizeof(str));        
+        //BF_LOG("pid: %d, msg: %s", g_pid, str);
         mutex_lock(&irq_count_lock);
         g_bf_dev->irq_count = 1;
         mutex_unlock(&irq_count_lock);
@@ -844,19 +797,16 @@ static void bf_recv_netlink_msg(struct sk_buff *__skb)
     kfree_skb(__skb);
 }
 
-/*
-#ifndef MTK_ANDROID_L
 static int bf_destroy_inputdev(void)
 {
     if (bf_inputdev) {
         input_unregister_device(bf_inputdev);
-        //input_free_device(bf_inputdev);
+        input_free_device(bf_inputdev);
         bf_inputdev = NULL;
     }
     return 0;
 }
-#endif
-*/
+
 static int bf_close_netlink(struct bf_device *bf_dev)
 {
     if (bf_dev->netlink_socket != NULL) {
@@ -892,11 +842,7 @@ static irqreturn_t bf_eint_handler (int irq, void *data)
     struct bf_device *bf_dev = (struct bf_device *)data;
 
     wait_event_interruptible_timeout(waiting_spi_prepare, !atomic_read(&suspended), msecs_to_jiffies (100));
-#ifdef KERNEL_4_9
-    __pm_wakeup_event(&fp_suspend_lock, 2 * HZ);
-#else
     wake_lock_timeout(&fp_suspend_lock, 2 * HZ);
-#endif
     BF_LOG("++++irq_handler netlink send+++++,%d,%d", g_bf_dev->irq_count, bf_dev->doing_reset);
     if(g_bf_dev->irq_count) {
         if(!bf_dev->doing_reset) {
@@ -910,21 +856,27 @@ static irqreturn_t bf_eint_handler (int irq, void *data)
     return IRQ_HANDLED;
 }
 
+#ifdef FAST_VERSION
+int g_bl229x_enbacklight = 1;
+#endif
+
 /* -------------------------------------------------------------------- */
 /* file operation function                                                                                */
 /* -------------------------------------------------------------------- */
 static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     int error = 0;
+#ifdef FAST_VERSION
     u32 bl229x_enbacklight = 0;
+    u32 chipid = 0x5283;
+#endif
 #ifdef BF_REE
     bl_read_write_reg_command_t read_write_cmd;
     int dma_size = 0;
 #endif
     struct bf_device *bf_dev = NULL;
     unsigned int key_event = 0;
-    unsigned int value = 0;
-    BF_LOG("bf_ioctl.");
+    BF_LOG("bf_ioctl davie.");
 
     bf_dev = (struct bf_device *)filp->private_data;
     if (_IOC_TYPE(cmd) != BF_IOCTL_MAGIC_NO) {
@@ -977,6 +929,7 @@ static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         input_report_key(bf_inputdev, key_event, 0);
         input_sync(bf_inputdev);
         break;
+#ifdef FAST_VERSION
     case BF_IOCTL_ENBACKLIGHT:
         BF_LOG("BF_IOCTL_ENBACKLIGHT arg:%d\n", (int)arg);
         g_bl229x_enbacklight = (int)arg;
@@ -989,10 +942,11 @@ static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         }
         break;
     case BF_IOCTL_GET_ID:
-        if (copy_to_user((void __user*)arg, &g_chip_type, sizeof(u32) * 1) != 0 ) {
+        if (copy_to_user((void __user*)arg, &chipid, sizeof(u32) * 1) != 0 ) {
             error = -EFAULT;
         }
         break;
+#endif
 #ifdef BF_REE
     case BF_IOCTL_REGISTER_READ_WRITE:
         BF_LOG("BTL:BF_IOCTL_REGISTER_READ_WRITE\n");
@@ -1034,7 +988,11 @@ static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         break;
 #endif
     case BF_IOCTL_INPUT_KEY_DOWN:
-        if(g_bl229x_enbacklight && g_bf_dev->need_report==0 && bf_key_need_report==0) {
+#ifdef FAST_VERSION
+        if(g_bl229x_enbacklight && g_bf_dev->need_report == 0) {
+#else
+        if(g_bf_dev->need_report == 0) {
+#endif
             bf_key_need_report = 1;
             key_event = (int)arg;
             input_report_key(bf_inputdev, key_event, 1);
@@ -1051,11 +1009,7 @@ static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         break;
     case BF_IOCTL_LOW_RESET:
         BF_LOG("BF_IOCTL_LOW_RESET:  command\n");
-#ifdef KERNEL_4_9
-        __pm_wakeup_event(&hw_reset_lock, 2 * HZ);
-#else
         wake_lock_timeout(&hw_reset_lock, 2 * HZ);
-#endif
         bf_hw_reset_level(g_bf_dev, 0);
         break;
 
@@ -1074,11 +1028,10 @@ static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         }
         break;
 
-    case BF_IOCTL_TRANS_IC_INFO:
-        BF_LOG("BTL:BF_IOCTL_TRANS_IC_INFO\n");
-        if (!copy_from_user(&ic_info, (bl_ic_info_t *)arg, sizeof(bl_ic_info_t))) {
-            BF_LOG("ic_info:  name = %s, chipid = %x, ta: %s, ca: %s \n",
-                   ic_info.ic_name, ic_info.ic_chipid, ic_info.ta_ver,ic_info.ca_ver);
+    case BF_IOCTL_NETLINK_PORT:
+        BF_LOG("BF_IOCTL_NETLINK_PORT:  command\n");
+        if (copy_to_user((void __user*)arg, &g_netlink_port, sizeof(u32) * 1) != 0 ) {
+            error = -EFAULT;
         }
         break;
 
@@ -1089,8 +1042,7 @@ static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
     case BF_IOCTL_REMOVE_DEVICE:
         BF_LOG("BF_IOCTL_REMOVE_DEVICE:  command\n");
-        //bf_remove(g_bf_dev->pdev);
-        bf_unregister();
+        bf_remove(g_bf_dev->pdev);
         break;
 
     case BF_IOCTL_RESET_FLAG:
@@ -1108,24 +1060,6 @@ static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             error = -EFAULT;
         }
         break;
-    case BF_IOCTL_CREATE_INPUT:
-        BF_LOG("BF_IOCTL_CREATE_INPUT:  command\n");
-        error = bf_create_inputdev();
-        if (error) {
-            BF_LOG("BF_IOCTL_CREATE_INPUT:  error\n");
-        }
-        break;
-    case BF_IOCTL_COMPATIBLE_IN_HAL:
-        BF_LOG("BF_IOCTL_COMPATIBLE_IN_HAL:  command\n");
-#ifdef COMPATIBLE_IN_HAL
-        value = 1;
-#else
-        value = 0;
-#endif
-        if (copy_to_user((void __user*)arg, &value, sizeof(u32) * 1) != 0 ) {
-            error = -EFAULT;
-        }
-        break;
     default:
         BF_LOG("Supportn't this command(%x)\n", cmd);
         break;
@@ -1133,8 +1067,6 @@ static long bf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
     return error;
 }
-
-
 #ifdef CONFIG_COMPAT
 static long bf_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
@@ -1195,20 +1127,14 @@ static int bf_release (struct inode *inode, struct file *file)
 static int bf_suspend (struct platform_device *pdev, pm_message_t state)
 {
     BF_LOG("  ++\n");
-    mutex_lock(&g_dev_lock);
-    if(g_bf_dev != NULL)
-        g_bf_dev->need_report = 1;
-    mutex_unlock(&g_dev_lock);
+    g_bf_dev->need_report = 1;
     BF_LOG("\n");
     return 0;
 }
 static int bf_resume (struct platform_device *pdev)
 {
     BF_LOG("  ++\n");
-    mutex_lock(&g_dev_lock);
-    if(g_bf_dev != NULL)
-        g_bf_dev->need_report = 0;
-    mutex_unlock(&g_dev_lock);
+    g_bf_dev->need_report = 0;
     BF_LOG("\n");
     return 0;
 }
@@ -1236,8 +1162,8 @@ int bf_remove(struct platform_device *pdev)
 {
     struct bf_device *bf_dev = g_bf_dev;
     BF_LOG("bf_remove++++");
-    mutex_lock(&g_dev_lock);
-    //bf_remove_attributes(&bf_dev->pdev->dev);
+
+    bf_remove_attributes(&bf_dev->pdev->dev);
     bf_sysfs_uninit();
 
     bf_hw_power(bf_dev, 0);
@@ -1260,7 +1186,7 @@ int bf_remove(struct platform_device *pdev)
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
     unregister_early_suspend(&bf_dev->early_suspend);
 #endif
-
+    bf_destroy_inputdev();
     misc_deregister(&bf_misc_device);
     bf_close_netlink(bf_dev);
 
@@ -1268,22 +1194,15 @@ int bf_remove(struct platform_device *pdev)
     free_pages((unsigned long)bf_dev->image_buf, get_order(BUF_SIZE));
 #endif
 
+    kfree(bf_dev);
     platform_set_drvdata(bf_dev->pdev, NULL);
-    if(NULL != bf_dev)
-        kfree(bf_dev);
-    bf_dev      = NULL;
-    g_bf_dev    = NULL;
-    mutex_unlock(&g_dev_lock);
+
     BF_LOG("bf_remove----");
     return 0;
 }
 
 static int bf_create_inputdev(void)
 {
-    if (bf_inputdev) {
-        BF_LOG("bf_inputdev in not null, already created!\n");
-        return 0;
-    }
     bf_inputdev = input_allocate_device();
     if (!bf_inputdev) {
         BF_LOG("bf_inputdev create faile!\n");
@@ -1325,7 +1244,7 @@ static int bf_create_inputdev(void)
     return 0;
 }
 
-int bf_init_dts_and_irq(struct bf_device *bf_dev)
+static int bf_init_dts_and_irq(struct bf_device *bf_dev)
 {
     int32_t status = -EINVAL;
     BF_LOG( "    ++++");
@@ -1338,13 +1257,11 @@ int bf_init_dts_and_irq(struct bf_device *bf_dev)
     status = bf_main_pin_init(bf_dev);
     if(status) {
         BF_LOG("bf_main_init fail:%d", status);
-        bf_main_gpio_uninit(bf_dev);
-        bf_main_pin_uninit(bf_dev);
         return -2;
     }
 
 #ifdef MTK_ANDROID_L
-    mt_eint_registration(bf_dev->irq_num, EINTF_TRIGGER_RISING/*CUST_EINTF_TRIGGER_RISING*/, bf_eint_handler_l, 1);
+    mt_eint_registration(bf_dev->irq_num, EINTF_TRIGGER_RISING/*CUST_EINTF_TRIGGER_RISING*/, bf_eint_handler_l, 0);
     INIT_WORK(&(bf_dev->fingerprint_work), work_func);
     bf_dev->fingerprint_workqueue = create_singlethread_workqueue("bf_fingerpirnt_thread");
 #else
@@ -1353,12 +1270,9 @@ int bf_init_dts_and_irq(struct bf_device *bf_dev)
 
     if (status) {
         BF_LOG("irq thread request failed, retval=%d\n", status);
-        bf_main_gpio_uninit(bf_dev);
-        bf_main_pin_uninit(bf_dev);
         return -3;
     }
 
-    bf_hw_power(bf_dev, 1);
     bf_hw_reset(bf_dev);
 
     enable_irq_wake(bf_dev->irq_num);
@@ -1384,13 +1298,8 @@ static int bf_probe(struct platform_device *pdev)
     bf_dev->irq_count = 0;
     bf_dev->doing_reset = 0;
     bf_dev->report_key = KEY_F10;
-#ifdef KERNEL_4_9
-    wakeup_source_init(&fp_suspend_lock, "fp_wakelock");
-    wakeup_source_init(&hw_reset_lock, "fp_reset_wakelock");
-#else
     wake_lock_init(&fp_suspend_lock, WAKE_LOCK_SUSPEND, "fp_wakelock");
     wake_lock_init(&hw_reset_lock, WAKE_LOCK_SUSPEND, "fp_reset_wakelock");
-#endif
     atomic_set(&suspended, 0);
     g_bf_dev = bf_dev;
     platform_set_drvdata(pdev, bf_dev);
@@ -1404,22 +1313,26 @@ static int bf_probe(struct platform_device *pdev)
     }
 #endif
 
-#if defined(COMPATIBLE_IN_HAL) || defined(COMPATIBLE)
-    BF_LOG("compatible in hal or COMPATIBLE, do not init gpio pin hw reset and init_irq.");
-#else
+#ifndef COMPATIBLE_IN_HAL
     status = bf_init_dts_and_irq(bf_dev);
-    if (status) {
+    if (status == -1) {
         goto err2;
+    } else if (status == -2) {
+        goto err3;
+    } else if (status == -3) {
+        goto err4;
     }
+#else
+    BF_LOG("compatible in hal, do not init gpio pin hw reset and init_irq.");
 #endif
 
     /* netlink interface init */
-    /*BF_LOG ("bf netlink config");
+    BF_LOG ("bf netlink config");
     if (bf_init_netlink(bf_dev) < 0) {
         BF_LOG ("bf_netlink create failed");
         status = -EINVAL;
         goto err5;
-    }*/
+    }
 
     status = misc_register(&bf_misc_device);
     if(status) {
@@ -1427,12 +1340,18 @@ static int bf_probe(struct platform_device *pdev)
         goto err6;
     }
 
+    status = bf_create_inputdev();
+    if(status) {
+        BF_LOG("bf_create_inputdev failed\n");
+        goto err7;
+    }
+
 #if defined(CONFIG_FB)
     bf_dev->fb_notify.notifier_call = fb_notifier_callback;
     status = fb_register_client(&bf_dev->fb_notify);
     if(status) {
-        BF_LOG("fb_register_client failed\n");
-        goto err7;
+        BF_LOG("bf_create_inputdev failed\n");
+        goto err8;
     }
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
     bf_dev->early_suspend.suspend = early_suspend;
@@ -1443,13 +1362,13 @@ static int bf_probe(struct platform_device *pdev)
 
     status = bf_sysfs_init();
     if(status) {
-        BF_LOG("bf_sysfs_init failed\n");
-        goto err8;
+        BF_LOG("bf_create_inputdev failed\n");
+        goto err9;
     }
 
-    //bf_create_attributes(&bf_dev->pdev->dev);
+    bf_create_attributes(&bf_dev->pdev->dev);
 
-#if !defined(COMPATIBLE_IN_HAL) && !defined(COMPATIBLE)
+#ifndef COMPATIBLE_IN_HAL
     bf_hw_power(bf_dev, 1);
     bf_hw_reset(bf_dev);
 #endif
@@ -1458,23 +1377,24 @@ static int bf_probe(struct platform_device *pdev)
     status = bf_spi_init(bf_dev);
     if(status) {
         BF_LOG("bf_spi_init fail:%d", status);
-        goto err9;
+        goto err10;
     }
 #endif
 
     BF_LOG ("bf_probe success!");
     return 0;
 
-err9:
-    //bf_remove_attributes(&bf_dev->pdev->dev);
+err10:
+    bf_remove_attributes(&bf_dev->pdev->dev);
     bf_sysfs_uninit();
-err8:
+err9:
 #if defined(CONFIG_FB)
     fb_unregister_client(&bf_dev->fb_notify);
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
     unregister_early_suspend(&bf_dev->early_suspend);
 #endif
-
+err8:
+    bf_destroy_inputdev();
 err7:
     misc_deregister(&bf_misc_device);
 err6:
@@ -1485,13 +1405,17 @@ err5:
 #else
     disable_irq_nosync(bf_dev->irq_num);
 #endif
+err4:
+    bf_main_gpio_uninit(bf_dev);
+err3:
+    bf_main_pin_uninit(bf_dev);
 err2:
 #if defined(BF_REE)
     free_pages((unsigned long)bf_dev->image_buf, get_order(BUF_SIZE));
 #endif
 err1:
-    platform_set_drvdata(bf_dev->pdev, NULL);
     kfree(bf_dev);
+    platform_set_drvdata(bf_dev->pdev, NULL);
 err0:
     BF_LOG("bf_probe occured error \n");
     return status;
@@ -1499,7 +1423,7 @@ err0:
 
 #ifdef CONFIG_OF
 static struct of_device_id bf_of_table[] = {
-    {.compatible = "betterlife,platform",},
+    {.compatible = "betterlife,fingerprint",},
     {},
 };
 //MODULE_DEVICE_TABLE(of, bf_of_table);
@@ -1529,15 +1453,6 @@ static struct platform_driver bf_plt_driver = {
 
 module_platform_driver(bf_plt_driver);
 
-void bf_unregister()
-{
-    platform_driver_unregister(&bf_plt_driver);
-
-#if defined(BF_REE) || defined(COMPATIBLE) || defined(CONFIG_MTK_CLK)
-    bf_spi_unregister();
-#endif
-}
-
 #ifdef MTK_ANDROID_L    /*if active this, MUST no use platform dts, otherwise kernel crashes*/
 static int  bf_plt_init(void)
 {
@@ -1563,10 +1478,9 @@ static int  bf_plt_init(void)
 static void  bf_plt_exit(void)
 {
     BF_LOG ("exit !");
-    bf_unregister();
 }
 
-late_initcall(bf_plt_init);
+module_init(bf_plt_init);
 module_exit(bf_plt_exit);
 #endif
 
