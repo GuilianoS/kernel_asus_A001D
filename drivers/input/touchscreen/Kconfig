@@ -1135,8 +1135,15 @@ config TOUCHSCREEN_MAXIM_STI
 	  To compile this driver as a module, choose M here: the
 	  module will be called maxim_sti.
 
+menuconfig TOUCHSCREEN_FTS
+	tristate "Focaltech Touchscreen"
+	depends on I2C
+	default n
+	help
+		Say Y here if you have Focaltech touch panel.
+		If unsure, say N.
+
 source "drivers/input/touchscreen/gt9xx/Kconfig"
-source "drivers/input/touchscreen/focaltech_touch/Kconfig"
 
 config TOUCHSCREEN_HIMAX_CHIPSET
 	bool "Himax touchpanel CHIPSET"
